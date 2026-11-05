@@ -1,0 +1,5 @@
+C:\Users\Paulo\Downloads\C# Silksong\obj\Debug\netstandard2.0\SilksongArena.csproj.AssemblyReference.cache
+C:\Users\Paulo\Downloads\C# Silksong\obj\Debug\netstandard2.0\SilksongArena.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Paulo\Downloads\C# Silksong\obj\Debug\netstandard2.0\SilksongArena.AssemblyInfoInputs.cache
+C:\Users\Paulo\Downloads\C# Silksong\obj\Debug\netstandard2.0\SilksongArena.AssemblyInfo.cs
+C:\Users\Paulo\Downloads\C# Silksong\obj\Debug\netstandard2.0\SilksongArena.csproj.CoreCompileInputs.cache
