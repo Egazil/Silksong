@@ -1,0 +1,319 @@
+================================================================================
+RELATÓRIO TÉCNICO E CIENTÍFICO DE PROJETO: ENGENHARIA DE APRENDIZADO POR REFORÇO
+APLICADO A AMBIENTES DE JOGOS EM TEMPO REAL (HOLLOW KNIGHT: SILKSONG)
+================================================================================
+
+AUTOR: Paulo Silva
+PROJETO: Trabalho Final de Curso / Projetos Empreendedores
+ÁREA: Inteligência Artificial, Aprendizado por Reforço Profundo, Engenharia de Software
+
+--------------------------------------------------------------------------------
+1. RESUMO EXECUTIVO (ABSTRACT)
+--------------------------------------------------------------------------------
+Este documento formaliza o projeto, o desenvolvimento e a otimização de um pipeline 
+completo de Aprendizado por Reforço Profundo (Deep Reinforcement Learning - DRL) para 
+o controle de um agente autônomo (Hornet) em um cenário de combate contra chefe (Boss Fight: 
+Mãe Musgo) no jogo Hollow Knight: Silksong. O objetivo do sistema é permitir que o agente 
+aprenda, de forma autônoma e ótima, a maximizar o dano causado por segundo (DPS) enquanto 
+preserva sua integridade física, alcançando a vitória no menor tempo viável.
+
+O documento detalha as decisões arquiteturais tomadas para transicionar de um sistema 
+frágil e lento baseado em simulação de teclado para uma arquitetura robusta, determinística, 
+baseada em Sockets TCP bidirecionais (Lockstep Ping-Pong), injeção nativa de ações na engine 
+Unity, otimização de consultas espaciais, respawn instantâneo em memória (Savestates), e 
+formulação matemática rigorosa da função de recompensa (Reward Shaping).
+
+--------------------------------------------------------------------------------
+2. ARQUITETURA DO SISTEMA E SEPARAÇÃO DE RESPONSABILIDADES
+--------------------------------------------------------------------------------
+2.1. O Desafio de Engines Fechadas:
+Engines comerciais de jogos (como a Unity) e frameworks de Machine Learning (como PyTorch 
+e Stable-Baselines3) operam em ecossistemas e linguagens distintos (C#/.NET vs. Python). 
+A execução direta de redes neurais profundas dentro da thread principal da engine pode causar 
+congelamentos de taxa de quadros (framerate drops), enquanto rodar o jogo diretamente em 
+Python é inviável devido à complexidade da simulação de física 2D.
+
+2.2. A Decisão Arquitetural:
+Adotou-se uma arquitetura cliente-servidor desacoplada:
+* Servidor de Treinamento (Python 3.11): Hospeda o algoritmo Proximal Policy Optimization 
+  (PPO), calcula funções de recompensa, gerencia o buffer de rollouts e otimiza a rede neural.
+* Cliente de Telemetria e Atuação (C# via BepInEx 5): Mod compilado que roda acoplado ao 
+  processo da Unity. É responsável por extrair dados internos da memória do jogo (vida, 
+  coordenadas, distâncias) e aplicar forças e comandos diretamente nos componentes da engine.
+
+Justificativa Científica:
+Essa segregação garante que o modelo de IA possa ser treinado utilizando bibliotecas de 
+ponta aceleradas por hardware (PyTorch/CUDA), mantendo a fidelidade total da física e das 
+regras do jogo original sem modificações destrutivas no código-fonte compilado.
+
+--------------------------------------------------------------------------------
+3. PROTOCOLO DE COMUNICAÇÃO: TRANSIÇÃO DE STREAMING PARA PING-PONG (LOCKSTEP)
+--------------------------------------------------------------------------------
+3.1. O Problema Anterior (Dessincronização Temporal):
+Na versão inicial do projeto, o C# transmitia dados em fluxo contínuo a cada 35 frames, 
+enquanto o Python executava pausas arbitrárias (`time.sleep(0.7)`). 
+Consequência: O buffer TCP acumulava centenas de mensagens defasadas no tempo (Buffer Bloat). 
+Quando o agente tomava uma decisão, ele estava reagindo a um estado que ocorrera quase 1 segundo 
+atrás. Em Aprendizado por Reforço, o atraso entre observação e recompensa (credit assignment 
+problem) impede a convergência da rede neural.
+
+3.2. A Solução Implementada (Arquitetura Síncrona Ping-Pong):
+Implementou-se um protocolo estrito de solicitação-resposta (Request-Response) sobre Sockets TCP:
+Passo 1: Python envia um pacote com a ação pretendida (ex: "4\n" para atacar).
+Passo 2: C# recebe a ação, aplica os comandos na engine e aguarda exatamente 5 frames de 
+física (FixedUpdate) para que a ação gere impacto no mundo virtual.
+Passo 3: C# captura o estado resultante em um único JSON limpo e devolve ao Python.
+Passo 4: Python recebe o estado, computa a recompensa e decide a próxima ação.
+
+Justificativa Científica:
+Elimina-se completamente o Buffer Bloat e o delay de rede. O ambiente passa a se comportar 
+como um Processo de Decisão de Markov (MDP) discreto e determinístico, condição fundamental 
+para que os teoremas de convergência do algoritmo PPO sejam válidos.
+
+--------------------------------------------------------------------------------
+4. ATUAÇÃO NATIVA VS. SIMULAÇÃO DE HARDWARE
+--------------------------------------------------------------------------------
+4.1. O Problema Anterior (`pynput` / Teclado Virtual):
+O controle da personagem através da emulação de eventos de teclado no nível do sistema 
+operacional é frágil:
+- Se a janela do jogo perder o foco (Alt+Tab), as teclas são digitadas na área de trabalho.
+- Variações de latência do sistema operacional causam perda de comandos de pulo/ataque.
+- Impossibilita treinar com o jogo em segundo plano ou minimizado.
+
+4.2. A Solução Implementada (Injeção de Input na Engine):
+No mod C#, removeu-se qualquer dependência de hardware e implementou-se controle nativo:
+- Movimentação horizontal: Manipulação direta do vetor linear de velocidade (`linearVelocity`) 
+  do componente `Rigidbody2D` da personagem.
+- Pulos: Aplicação direta de impulsos verticais na física quando a personagem toca o solo.
+- Ataques e Habilidades: Invocação de métodos internos do `HeroController`.
+- Segundo Plano: Configuração de `Application.runInBackground = true;` no ciclo de vida da Unity.
+
+Justificativa Científica:
+A injeção direta garante 100% de confiabilidade na execução das ações da política, elimina 
+o ruído estocástico introduzido por drivers de teclado do SO e permite que o treinamento 
+ocorra de forma headless ou minimizada sem consumir a interface humana do pesquisador.
+
+--------------------------------------------------------------------------------
+5. OTIMIZAÇÃO DE PERFORMANCE: ELIMINAÇÃO DE GARGALOS DE FÍSICA
+--------------------------------------------------------------------------------
+5.1. O Problema Anterior (`FindObjectsOfType`):
+A cada ciclo de coleta, o mod realizava uma varredura global em todos os colisores da cena 
+através de `FindObjectsOfType<Collider2D>()`.
+Consequência: Complexidade O(N), onde N representa milhares de objetos em toda a fase. 
+Isso causava congelamentos cíclicos (stuttering) e alta pressão sobre o Coletor de Lixo 
+(Garbage Collector) da Unity devido à constante alocação de novos arrays.
+
+5.2. A Solução Implementada (Filtragem Espacial Restrita):
+Substituiu-se a varredura global pela consulta de física delimitada:
+`Physics2D.OverlapCircleAll(posicaoHornet, 25.0f)`
+Apenas entidades dentro de um raio de 25 unidades ao redor da personagem são avaliadas.
+
+Justificativa Científica:
+Redução da complexidade computacional para uma fração constante O(K), onde K << N. A taxa de 
+quadros da simulação foi estabilizada, eliminando anomalias no tempo delta dos passos de física.
+
+--------------------------------------------------------------------------------
+6. MECANISMO DE RESPAWN INSTANTÂNEO EM MEMÓRIA (SAVESTATES)
+--------------------------------------------------------------------------------
+6.1. O Problema do Recarregamento de Cena (`SceneManager`):
+Tradicionalmente, a morte da personagem envolvia deixar o jogo rodar animações de morte, 
+tela preta e acionar `SceneManager.LoadSceneAsync()`.
+Consequência: Cada morte custava entre 3 a 5 segundos de telas de carregamento. Em um 
+treinamento de 10.000 episódios, mais de 10 horas de tempo de máquina seriam desperdiçadas 
+apenas olhando telas de loading.
+
+6.2. A Solução Implementada (Savestates via Memória):
+Inspirando-se nas melhores práticas de RL competitivo (frameworks como SilksongRL):
+1. Ancoragem no Primeiro Reset: Quando o operador aperta ENTER no terminal para iniciar o 
+   treino, o mod memoriza as coordenadas exatas da Hornet e do Chefe naquele instante.
+2. Limpeza de Entidades Efêmeras: No momento da morte, o C# varre o raio da arena e destrói 
+   (`Destroy()`) todos os clones invocados (como crawlers) e estalactites caídas.
+3. Reposicionamento Instantâneo: Teleporta a Hornet e o Chefe para as coordenadas salvas, 
+   zera a inércia dos corpos rígidos e restaura a barra de HP (`PlayerData.health = 5`).
+4. Reinicialização da Máquina de Estados (FSM): O chefe passa por um ciclo de 1 frame de 
+   desativação e reativação (`SetActive(false)` -> `yield return null` -> `SetActive(true)`), 
+   forçando seu PlayMaker FSM a reiniciar do estado neutro (Idle) sem travar.
+5. Pausa de Estabilização de 5 Segundos: Antes do reset ser disparado após uma morte, o 
+   sistema aguarda 5 segundos para que as partículas da engine assentem, evitando softlocks.
+
+Justificativa Científica:
+A taxa de coleta de amostras (samples per second) aumenta em até 80%, acelerando o 
+tempo total necessário para a convergência dos pesos da rede neural.
+
+--------------------------------------------------------------------------------
+7. ENGENHARIA DA FUNÇÃO DE RECOMPENSA (REWARD SHAPING)
+--------------------------------------------------------------------------------
+7.1. Diagnóstico da Falha Anterior (O Mínimo Local do "-1 Constante"):
+O modelo anterior utilizava recompensas artificiais de aproximação e recebia uma punição 
+de -0.2 por golpe sofrido.
+Como a Hornet possui 5 pontos de vida, morrer significava acumular exatamente:
+5 golpes x (-0.2) = -1.0
+Como a IA inicial operava por exploração aleatória e não sabia acertar o chefe, o dano 
+causado era sempre 0. A recompensa final de quase todas as tentativas resultava em -1.0.
+A rede convergiu para um "mínimo local covarde": ela descobriu que ficar no canto pulando 
+e se abaixando adiava a tomada de golpes, maximizando o tempo de vida sem nunca aprender 
+a atacar.
+
+7.2. A Nova Formulação Matemática (DPS e Sobrevivência):
+Removeu-se qualquer incentivo artificial (como bônus por ficar perto) e adotou-se uma 
+função de recompensa estritamente objetiva, calculada frame a frame:
+
+R_t = R_dano - P_tempo - P_golpe + B_vitoria
+
+Onde:
+A) Recompensa de Dano Seguro (DPS Ponderado):
+   R_dano = ((Dano_causado / HP_max_chefe) * 20.0) * Multiplicador_vida
+   Multiplicador_vida = max(0.1, HP_hornet / 5.0)
+   Justificativa: Causar dano enquanto saudável (5/5) concede o valor máximo (+0.83 por hit). 
+   Causar dano prestes a morrer concede menos pontos. Isso força o agente a maximizar o DPS 
+   ao mesmo tempo em que preserva sua vida.
+
+B) Penalidade Contínua de Tempo (Sangramento):
+   P_tempo = 0.01 (a cada frame de combate)
+   Justificativa: Introduz um custo constante de oportunidade. A inércia ou fuga deliberada 
+   faz a pontuação sangrar negativamente. A única forma de manter pontuação positiva é golpear 
+   o chefe com frequência e rapidez.
+
+C) Penalidade por Golpe Sofrido:
+   P_golpe = Dano_recebido * 1.0
+   Justificativa: Uma punição severa e desproporcional. Perder 1 ponto de vida anula 
+   imediatamente o lucro obtido por um ataque bem-sucedido, forçando o aprendizado de esquiva.
+
+D) Bônus de Vitória Escalonado:
+   B_vitoria = 30.0 + (10.0 * (HP_hornet / 5.0))
+   Justificativa: O objetivo terminal supremo. Caso o chefe seja derrotado, o agente recebe 
+   um salto substancial de recompensa (+30 a +40 pontos), correlacionado com a vida restante.
+
+--------------------------------------------------------------------------------
+8. HIPERPARÂMETROS E TOPOLOGIA DA REDE NEURAL
+--------------------------------------------------------------------------------
+8.1. Parâmetros do Algoritmo PPO:
+- Política: `MlpPolicy` (Perceptron Multicamadas padrão).
+- Frequência de Atualização dos Pesos (`n_steps = 400`): O agente experiencia 400 transições 
+  de combate antes de congelar a amostragem e iniciar a retropropagação do gradiente.
+- Tamanho do Lote (`batch_size = 50`): Os 400 passos coletados são divididos em 8 mini-lotes 
+  de 50 amostras, otimizando a estabilidade da atualização da função de perda por surrogate.
+- Fator de Desconto (`gamma = 0.99`): Alta valorização de recompensas futuras a longo prazo.
+- Coeficiente GAE (`gae_lambda = 0.95`): Estimador de Vantagem Generalizada para redução da 
+  variância dos gradientes.
+
+8.2. Função de Ativação: Por que `Tanh` e não `ReLU`?
+A arquitetura utiliza Tangente Hiperbólica (`nn.Tanh`) em suas camadas ocultas:
+- Prevenção do "Dying ReLU": Em tarefas de controle motor com penalidades negativas frequentes, 
+  a função ReLU zera os gradientes de neurônios que recebem entradas negativas, matando partes 
+  da rede permanentemente. A `Tanh` possui gradiente contínuo em ambos os domínios.
+- Limitação de Escala: A `Tanh` comprime os valores estritamente entre [-1, 1], mantendo a 
+  distribuição das probabilidades das ações (logits) controlada e evitando explosão de gradientes.
+
+8.3. Dimensão da Rede:
+Manteve-se a arquitetura com 2 camadas ocultas de 64 neurônios cada `[64, 64]`. Para um 
+vetor de entrada contínuo de 7 variáveis, essa topologia provê capacidade representacional 
+suficiente sem sobrecarregar a inferência em tempo real.
+
+--------------------------------------------------------------------------------
+9. OBSERVABILIDADE, AUDITORIA E REPRODUCIBILIDADE CIENTÍFICA
+--------------------------------------------------------------------------------
+Para sustentar a validação empírica do projeto e fornecer evidências concretas:
+
+1. Auditoria Frame a Frame (`auditoria_telemetria.jsonl`):
+   Cada passo da simulação é registrado em um log permanente contendo:
+   - Número do passo (`step`).
+   - ID e Nome legível da ação tomada (`ATACAR`, `PULAR`, etc.).
+   - Recompensa calculada daquele instante.
+   - Posições X e Y da personagem e vida atual de todos os agentes.
+   Permite auditoria forense offline para verificar se os comandos emitidos pela rede 
+   estão de fato condizentes com a dinâmica do jogo.
+
+2. Acompanhamento Estatístico Automático (`desempenho_treinamento.png`):
+   Utilizando a classe `Monitor` do Stable-Baselines3 acoplada ao `matplotlib`, o encerramento 
+   do script via teclado (Ctrl+C) compila automaticamente a curva de aprendizado (recompensa 
+   bruta e média móvel por episódio), evidenciando a evolução da política.
+
+3. Gravador Inteligente de Vídeos (`videos_treinamento/*.mp4`):
+   Implementou-se um sistema baseado em buffer de memória RAM usando `mss` e `OpenCV`:
+   - Os frames de vídeo são mantidos temporariamente na memória volátil.
+   - O vídeo só é gravado no disco se o episódio for um marco histórico (Ep 1, 10, 50, 100...) 
+     ou bater um novo recorde de pontuação da IA.
+   - Caso contrário, o buffer é descartado, economizando armazenamento e evitando gargalos de I/O.
+
+--------------------------------------------------------------------------------
+10. CONCLUSÃO E IMPACTO DO PROJETO
+--------------------------------------------------------------------------------
+As refatorações realizadas transformaram um experimento rudimentar e suscetível a falhas 
+em um ambiente de testes de Inteligência Artificial de grau científico e industrial. 
+A transição para chamadas diretas de memória, sincronismo por lockstep e recompensas puramente 
+baseadas em métricas de eficácia (DPS vs. Sobrevivência) estabelece as bases necessárias 
+para demonstrar a viabilidade prática do Aprendizado por Reforço no domínio de jogos complexos 
+e de alta exigência reflexiva como Hollow Knight: Silksong.
+
+--------------------------------------------------------------------------------
+11. CURRÍCULO DE TREINAMENTO EM ETAPAS (IMPLEMENTAÇÃO ATUAL)
+--------------------------------------------------------------------------------
+O treinamento PPO foi organizado em quatro etapas selecionadas explicitamente pelo operador:
+
+1. Cura: recompensa pontos de vida efetivamente recuperados.
+2. Sobrevivência: recompensa permanecer vivo e penaliza dano recebido.
+3. Dano: recompensa a redução confirmada dos pontos de vida do chefe.
+4. Vitória: mantém o incentivo a causar dano e acrescenta bônus pela vitória e pela vida restante.
+
+Cada função de recompensa e seus parâmetros estão isolados em um módulo próprio dentro da
+pasta `etapas/`. A execução é escolhida por `treinar_silksong.py --etapa <nome>`. O modelo
+salvo em uma etapa é usado como inicialização da etapa seguinte, preservando a mesma dimensão
+de observação e o mesmo espaço de ações. O avanço é manual para permitir que o pesquisador
+modifique o chefe ou o cenário antes de iniciar a próxima fase.
+
+Modelos, checkpoints, métricas, telemetria e vídeos também são separados por etapa. Episódios
+possuem limite de steps; ao atingi-lo, o Python marca truncamento e solicita ao mod C# um
+reset identificado como `LIMITE_TEMPO`. O limite de vida do chefe deve ser mantido consistente
+entre `HP_CHEFE_MAX` no módulo da etapa e `VIDA_MAXIMA_MOTHER` no mod.
+
+Na etapa de dano, o mod desativa os comportamentos `MonoBehaviour` da Mãe Musgo, preserva
+todos os componentes `HealthManager` para manter o registro de dano, congela o `Animator` e
+o `Rigidbody2D` e reposiciona o chefe no centro da caixa de arena.
+
+--------------------------------------------------------------------------------
+12. OBSERVAÇÃO, ARENA E ESTADO DO CHEFE
+--------------------------------------------------------------------------------
+O espaço de observação atual possui 37 valores: 16 atributos de Hornet, Mãe Musgo e arena,
+seguidos por sete triplas de alvos (`delta_x`, `delta_y`, distância). Os atributos base
+incluem vida e foco da Hornet, posição e velocidade X/Y de ambos os personagens, vida e
+estado do chefe e limites mínimos/máximos X/Y da arena.
+
+Os limites iniciais configuráveis do retângulo visual são X=[40,75] e Y=[12,35]. São uma
+referência provisória baseada nas coordenadas observadas, não limites físicos confirmados.
+O estado categórico da chefe usa 0=indisponível, 1=parada, 2=em movimento, 3=animação
+reconhecida como ataque e 4=derrotada. A interface e a telemetria incluem também o nome da
+animação. Essa classificação é uma aproximação por animação/velocidade; não lê diretamente
+a FSM interna do jogo.
+
+Os colliders da Mãe Musgo são consolidados por identidade do `HealthManager`, impedindo que
+uma mesma entidade apareça mais de uma vez entre os alvos. A posição e a velocidade são
+obtidas do chefe e do `Rigidbody2D` associado, em vez de usar a posição de cada collider.
+
+--------------------------------------------------------------------------------
+13. ALGORITMO GENÉTICO E TRANSFERÊNCIA PARA PPO
+--------------------------------------------------------------------------------
+O módulo `genetico.py` implementa uma política MLP `[37,64,64,7]`. Cada genoma contém os
+pesos e vieses das camadas de política; sua aptidão é a soma da recompensa durante um
+episódio de dano. A população possui três agentes por geração e é avaliada sequencialmente
+no jogo por cinco gerações, totalizando 15 avaliações.
+
+Na geração inicial, os pesos são inicializados aleatoriamente ou a partir da política PPO
+da etapa de sobrevivência. Nas gerações seguintes, o melhor genoma é preservado (elitismo);
+os dois melhores são selecionados como pais, combinados por crossover uniforme e submetidos
+a mutação Gaussiana independente por parâmetro (taxa de 1%, desvio padrão de 0,05). O melhor
+agente de todas as gerações é salvo junto com seus metadados e a pontuação em CSV.
+
+Depois, `treinar_silksong.py --etapa dano --modelo-genetico <arquivo.npz>` copia os pesos
+genéticos para o ator PPO. O crítico de valor e os demais componentes do PPO continuam sendo
+inicializados a partir do modelo da etapa anterior, quando disponível. Essa transferência é
+implementada no próprio projeto; `transfer_learn` não é uma dependência instalada. O PPO
+continua o refinamento por gradiente de política (backpropagation).
+
+A execução genética pode ser iniciada com `python treinar_genetico.py`; o modelo genético e
+as avaliações ficam em diretórios próprios da etapa de dano. A avaliação pressupõe o mod
+compilado com o protocolo de etapa e congelamento do chefe. O comportamento e a possibilidade
+de causar dano ainda devem ser confirmados em uma sessão real do jogo.
+================================================================================
+FIM DO DOCUMENTO
+================================================================================

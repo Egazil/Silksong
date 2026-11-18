@@ -1,0 +1,107 @@
+================================================================================
+RELATÓRIO TÉCNICO DE REFATORAÇÃO E OTIMIZAÇÃO DO AMBIENTE DE RL (VERSÃO 2.0)
+PROJETO: AGENTE AUTÔNOMO VIA APRENDIZADO POR REFORÇO PROFUNDO (PPO) NO JOGO SILKSONG
+================================================================================
+
+1. INTRODUÇÃO E OBJETIVO DO DOCUMENTO
+O presente documento detalha as atualizações de arquitetura, correções de viés experimental e aprimoramentos de modelagem implementados na Versão 2.0 do ambiente de treinamento por Aprendizado por Reforço Profundo (Deep Reinforcement Learning - DRL). O projeto integra o motor de jogo Unity (via Modding em C#) a um ecossistema de treinamento em Python (utilizando Gymnasium e Stable-Baselines3 com o algoritmo PPO - Proximal Policy Optimization).
+
+O objetivo primordial desta refatoração foi conferir validade ecológica e metodológica ao experimento científico, assegurando que o agente inteligente aprenda sob as mesmas regras, restrições e dinâmicas físicas que regem um jogador humano real, eliminando comportamentos artificiais induzidos por manipulação direta de memória.
+
+
+--------------------------------------------------------------------------------
+2. MOTIVAÇÕES E PROBLEMAS IDENTIFICADOS NA VERSÃO ANTERIOR (V1.0)
+--------------------------------------------------------------------------------
+
+2.1. VIÉS MECÂNICO POR INJEÇÃO DIRETA DE FÍSICA
+- O que ocorria: A locomoção e o salto da personagem eram realizados atribuindo valores arbitrários diretamente à propriedade 'linearVelocity' do componente Rigidbody2D da Unity.
+- Por que foi um problema: Ao forçar a velocidade linear via código, o agente burlava a máquina de estados ('State Machine') do jogo. A personagem conseguia se mover durante animações de dano (atordoamento) ou manter impulsos no ar que violam a física padrão do jogo. A IA não estava aprendendo a jogar o jogo real, mas sim um ambiente adulterado.
+
+2.2. BYPASS DE COOLDOWNS E ANIMAÇÕES VIA REFLECTION
+- O que ocorria: As ações de ataque e cura eram disparadas invocando métodos internos privados ('HeroController.Attack' e 'Focus') por meio de Reflection no C#.
+- Por que foi um problema: Em condições reais de gameplay, ações possuem tempos de recuperação (cooldowns) e animações prévias e posteriores (wind-up e recovery frames). A invocação via Reflection forçava a execução imediata desses métodos a qualquer instante, além de consumir excessiva taxa de processamento por frame (CPU overhead) devido à inspeção dinâmica de métodos.
+
+2.3. RESTRIÇÃO DO ESPAÇO DE AÇÃO DISCRETO (PULO FIXO E FALTA DE SIMULTANEIDADE)
+- O que ocorria: O ambiente operava com um espaço de ação discreto ('Discrete(6)'), no qual a rede só podia escolher um único comando por passo de tempo (0 a 5).
+- Por que foi um problema: 
+  a) Pulo Variável: No jogo Silksong, a altura do salto é proporcional ao tempo em que o botão é mantido pressionado. No modelo anterior, o pulo tinha altura constante e imutável.
+  b) Simultaneidade: Em jogos de ação rápida e plataforma, é indispensável executar ações combinadas (como correr para frente, pular e atacar simultaneamente). Um espaço puramente discreto impedia comandos compostos.
+  c) Ataques Direcionais: Era inviável mirar golpes para cima ou desferir ataques para baixo ("pogo jump"), pois os direcionais vertical e horizontal não podiam ser combinados com o golpe.
+
+2.4. PERCEPÇÃO ESPACIAL REDUZIDA ("CEGUEIRA ESPACIAL")
+- O que ocorria: O vetor de observação ('observation_space') continha apenas 7 variáveis escalares. Dessas, apenas a quantidade total de alvos e a menor distância até um único alvo informavam a presença de perigos.
+- Por que foi um problema: A IA não recebia a orientação angular nem as coordenadas relativas das ameaças. Se um projétil caísse em sua cabeça ou se um inimigo avançasse pela retaguarda, o agente apenas detectava que "algo estava a X metros", tornando impossível aprender estratégias de esquiva direcionada.
+
+2.5. INSTABILIDADE DE SINCRONIZAÇÃO E DEADLOCK DE REDE (TCP)
+- O que ocorria: A rotina de 'Savestate' (Respawn Instantâneo) em C# exige uma pausa de estabilização de 5 segundos para a finalização das animações do jogo. No lado Python, o socket TCP não possuía um timeout configurado explicitamente (modo de bloqueio infinito).
+- Por que foi um problema: Qualquer micro-travamento do motor de jogo ou atraso nos frames de morte podia prender o Python indefinidamente em um estado de Deadlock, congelando todo o ciclo de treino.
+
+
+--------------------------------------------------------------------------------
+3. DETALHAMENTO DAS MUDANÇAS IMPLEMENTADAS NA VERSÃO 2.0
+--------------------------------------------------------------------------------
+
+3.1. VIRTUALIZAÇÃO DE INPUTS HUMANOS VIA TECLADO ('pydirectinput')
+- O que foi feito: O mod C# foi desprovido de qualquer injeção física. O controle da personagem passou a ser gerido integralmente pelo script Python através da biblioteca 'pydirectinput', que envia eventos de pressão e liberação de teclas físicas (Scan Codes) diretamente ao subsistema de entrada do Sistema Operacional.
+- Justificativa Técnica: Garante total neutralidade experimental (zero viés de código). O agente está sujeito às mesmas latências de animação, inércias e regras mecânicas que um jogador humano.
+
+3.2. REESTRUTURAÇÃO DO ESPAÇO DE AÇÃO PARA 'MultiBinary(6)'
+- O que foi feito: O espaço de ação foi convertido de 'Discrete(6)' para 'MultiBinary(6)', representando o estado booleano de 6 teclas independentes:
+  [Índice 0: Esquerda, Índice 1: Direita, Índice 2: Cima, Índice 3: Baixo, Índice 4: Pular, Índice 5: Atacar].
+- Justificativa Técnica: 
+  - Permite a sustentação contínua de teclas ('Key Hold') entre passos de simulação, viabilizando pulos curtos ou longos com precisão de tempo.
+  - Habilita ações simultâneas (ex: Mover para Direita + Pular + Atacar para Baixo).
+
+3.3. EXPANSÃO DO ESPAÇO DE OBSERVAÇÃO ESPACIAL (26 NEURÔNIOS DE ENTRADA)
+- O que foi feito: A entrada da rede neural foi expandida para 26 elementos contínuos, estruturada em:
+  - 5 Atributos Básicos da Personagem e do Chefe:
+    [Vida Hornet, Flag de Foco, Posição Global X, Posição Global Y, Vida da Mãe Musgo].
+  - 21 Atributos Vetoriais das 7 Entidades Mais Próximas:
+    Para cada uma das 7 entidades prioritárias (ordenadas dinamicamente por proximidade), extraem-se três valores cartesianos relativos:
+    * Delta X: (Posição X do Alvo - Posição X da Hornet)
+    * Delta Y: (Posição Y do Alvo - Posição Y da Hornet)
+    * Distância Euclidiana em Linha Reta.
+- Justificativa Técnica: Agora a rede neural processa vetores direcionais completos, identificando de qual quadrante a ameaça se aproxima.
+
+3.4. PADDING SEMÂNTICO SEGURO ([0.0, 0.0, 999.0])
+- O que foi feito: Quando há menos de 7 ameaças ativas dentro do radar, as vagas remanescentes no vetor de observação são completadas com a tupla fixa [0.0, 0.0, 999.0].
+- Justificativa Técnica: O uso de preenchimento convencional com zeros [0.0, 0.0, 0.0] comunicaria à rede neural a existência de um inimigo colado na hitbox da personagem (distância nula), induzindo reações falsas de esquiva. O valor 999.0 atua como um delimitador numérico claro de "perigo inexistente/fora de alcance".
+
+3.5. BOUNDING BOX VISUAL PARA VALIDAÇÃO EMPÍRICA IN-GAME
+- O que foi feito: No código C# ('SilksongRLTelemetriaMod.cs'), foi adicionada uma rotina no método 'OnGUI' que projeta e desenha um retângulo delimitador (Bounding Box) amarelo na tela, acompanhando a Hornet em tempo real.
+- Justificativa Técnica: Permite aos pesquisadores e avaliadores do projeto visualizarem visualmente a área de abrangência do radar (raio de detecção de 25 unidades) diretamente na interface gráfica durante as partidas.
+
+3.6. ROBUSTEZ TEMPORAL COM TIMEOUT DE 10 SEGUNDOS NO SOCKET TCP
+- O que foi feito: Configuração explícita de 'socket.settimeout(10.0)' na comunicação de rede do Python.
+- Justificativa Técnica: Fornece uma janela de tolerância suficiente para que o motor da Unity processe a rotina de Savestate (que aguarda 5 segundos para estabilizar a física pós-morte) sem que o cliente Python assuma prematuramente que a conexão caiu, prevenindo travamentos em loop infinito.
+
+3.7. INTEGRAÇÃO ROBUSTA COM CALLBACKS DE MONITORAMENTO CIENTÍFICO
+- O que foi feito: Injeção direta dos metadados de episódio (Recompensa Acumulada e Duração em Steps) na estrutura 'info' ao final de cada combate dentro de 'SilksongEnv.step()'. No script 'treinar_silksong.py', adicionou-se tratamento de exceções no carregamento de pesos para absorver mudanças de topologia da rede.
+- Justificativa Técnica: Garante que os registros gravados no arquivo 'monitor.csv' permaneçam consistentes, viabilizando a geração contínua do gráfico estatístico 'desempenho_treinamento.png' para uso em artigos e bancas de avaliação.
+
+
+--------------------------------------------------------------------------------
+4. QUADRO COMPARATIVO: VERSÃO 1.0 vs. VERSÃO 2.0
+--------------------------------------------------------------------------------
+
+MÉTRICA / REQUISITO          | VERSÃO 1.0 (ANTERIOR)            | VERSÃO 2.0 (ATUAL)
+-----------------------------|----------------------------------|----------------------------------
+Método de Input              | Injeção física / Reflection      | Virtualização de Teclado (OS)
+Viés Experimental            | Alto (burlava animações/física)  | Nulo (respeita regras humanas)
+Espaço de Ação               | Discreto (Discrete(6))           | Multi-Binário (MultiBinary(6))
+Capacidade de Pulo Variável  | Inexistente (altura fixa)        | Suportado (via key-holding)
+Ataques Direcionais (Cima/Pogo)| Inviável                        | Totalmente Suportado
+Tamanho da Observação        | 7 neurônios (escalares)          | 26 neurônios (vetores espaciais)
+Percepção de Ameaças         | 1 valor unidimensional           | 7 alvos com DeltaX, DeltaY e Dist
+Tratamento de Alvos Nulos    | Nenhum                           | Padding semântico [0, 0, 999]
+Supervisão Visual in-game    | Inexistente                      | Bounding Box em tela (OnGUI)
+Tolerância de Rede (Timeout) | Nenhuma (bloqueio infinito)      | Timeout calibrado de 10.0s
+
+
+--------------------------------------------------------------------------------
+5. CONCLUSÃO E IMPACTO ACADÊMICO
+--------------------------------------------------------------------------------
+A Versão 2.0 converteu o ambiente de um estado prototípico com manipulações de baixo nível para um sistema de experimentação científica rigoroso. Ao transferir os inputs para a camada do sistema operacional e fornecer percepção vetorial completa dos elementos dinâmicos da arena, o agente PPO é capacitado a desenvolver padrões de comportamento emergentes autênticos (como esquivas espaciais e sequenciamento ótimo de golpes), elevando a relevância metodológica dos dados coletados para apresentação no Trabalho de Conclusão / Projeto Empreendedor.
+================================================================================
+FIM DO RELATÓRIO TÉCNICO
+================================================================================
